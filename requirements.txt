@@ -1,0 +1,7 @@
+imaplib
+email
+smtplib
+nltk
+pandas
+matplotlib
+tkinter
