@@ -5,7 +5,12 @@ import re
 import tkinter.messagebox as messagebox
 
 class EmailConnector:
-    def __init__(self, config):
+    def __init__(self, config=None):
+        # 如果没有提供config参数，则自动加载
+        if config is None:
+            from config import load_config
+            config = load_config()
+            
         self.email_address = config.EMAIL_ADDRESS
         self.password = config.EMAIL_PASSWORD
         self.imap_server = config.IMAP_SERVER

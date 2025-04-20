@@ -3,7 +3,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit, QTreeWidget,
                              QTreeWidgetItem, QScrollArea, QFrame, QGridLayout, QGroupBox,
                              QCheckBox, QSplitter, QTableWidget, QTableWidgetItem, QHeaderView,
-                             QTabWidget, QMessageBox, QFileDialog)
+                             QTabWidget, QMessageBox, QFileDialog, QListWidget, QListWidgetItem,
+                             QDialog)
 from PyQt6.QtCore import Qt, QSize, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QIcon, QFont, QPixmap, QColor, QPalette
 
@@ -12,6 +13,10 @@ from email_connector import EmailConnector
 from email_classifier import EmailClassifier
 from auto_reply import AutoReplyGenerator
 from email_sender import EmailSender
+from template_manager import TemplateManager
+from email_analytics import EmailAnalytics, StatisticsWidget
+from attachment_handler import AttachmentHandler, AttachmentWidget
+from async_operations import AsyncEmailProcessor, QtThreadWorker
 
 
 class ThemeManager:
@@ -272,23 +277,40 @@ class BulkActionsWidget(QWidget):
 class EmailAssistantGUI(QMainWindow):
     """基于PyQt6的邮件助手主窗口"""
     
-    def __init__(self):
+    def __init__(self, email_connector=None, email_classifier=None, email_sender=None, 
+                 attachment_handler=None, template_manager=None, email_analytics=None,
+                 async_processor=None):
         super().__init__()
         
         # 配置初始化
-        self.config = config
+        from config import load_config
+        self.config = load_config()
         
         # 初始化邮件处理对象
-        self.email_connector = EmailConnector(self.config)
-        self.email_classifier = EmailClassifier(self.config)
+        self.email_connector = email_connector or EmailConnector(self.config)
+        self.email_classifier = email_classifier or EmailClassifier(self.config)
+        self.email_sender = email_sender or EmailSender(self.config)
+        
+        # 附加组件
+        self.attachment_handler = attachment_handler
+        self.template_manager = template_manager
+        self.email_analytics = email_analytics
+        self.async_processor = async_processor
+        
+        # 兼容性维护，用于旧代码
         self.auto_reply_generator = AutoReplyGenerator(self.config)
-        self.email_sender = EmailSender(self.config)
         
         # 邮件数据
         self.current_email = None
         
-        # 主题管理器
-        self.theme_manager = None
+        # 获取当前应用实例并初始化主题管理器
+        app = QApplication.instance()
+        if app:
+            self.theme_manager = ThemeManager(app)
+            # 默认应用浅色主题
+            self.theme_manager.apply_theme("light")
+        else:
+            self.theme_manager = None
         
         # 设置窗口属性
         self.setWindowTitle("自动邮件分类与回复助手")
@@ -407,15 +429,35 @@ class EmailAssistantGUI(QMainWindow):
         
         upper_splitter.addWidget(mail_list_container)
         
-        # 邮件内容区域
-        mail_content_container = QGroupBox("邮件内容")
-        mail_content_layout = QVBoxLayout(mail_content_container)
+        # 邮件内容和其他功能（使用标签页）
+        self.right_tab_widget = QTabWidget()
+        
+        # 邮件内容标签页
+        email_content_tab = QWidget()
+        email_content_layout = QVBoxLayout(email_content_tab)
         
         self.email_body_text = QTextEdit()
         self.email_body_text.setReadOnly(True)
-        mail_content_layout.addWidget(self.email_body_text)
+        email_content_layout.addWidget(self.email_body_text)
         
-        upper_splitter.addWidget(mail_content_container)
+        self.right_tab_widget.addTab(email_content_tab, "邮件内容")
+        
+        # 附件管理标签页
+        if self.attachment_handler:
+            self.attachment_widget = AttachmentWidget(self.attachment_handler)
+            self.right_tab_widget.addTab(self.attachment_widget, "附件管理")
+        
+        # 数据分析标签页
+        if self.email_analytics:
+            self.statistics_widget = StatisticsWidget(self.email_analytics)
+            self.right_tab_widget.addTab(self.statistics_widget, "数据分析")
+        
+        # 模板管理标签页
+        if self.template_manager:
+            self.template_tab = self.create_template_management_tab()
+            self.right_tab_widget.addTab(self.template_tab, "模板管理")
+        
+        upper_splitter.addWidget(self.right_tab_widget)
         
         # 设置初始分割大小
         upper_splitter.setSizes([400, 600])
@@ -429,6 +471,18 @@ class EmailAssistantGUI(QMainWindow):
         # 自动回复区域
         reply_container = QGroupBox("自动回复")
         reply_layout = QVBoxLayout(reply_container)
+        
+        # 模板选择（如果有模板管理器）
+        if self.template_manager:
+            template_layout = QHBoxLayout()
+            template_layout.addWidget(QLabel("选择模板:"))
+            
+            self.template_combo = QComboBox()
+            self.refresh_templates_combo()
+            self.template_combo.currentIndexChanged.connect(self.apply_selected_template)
+            template_layout.addWidget(self.template_combo)
+            
+            reply_layout.addLayout(template_layout)
         
         reply_layout.addWidget(QLabel("自动回复内容:"))
         
@@ -507,110 +561,359 @@ class EmailAssistantGUI(QMainWindow):
             QMessageBox.critical(self, "错误", f"邮箱连接失败: {e}")
             
     def fetch_and_display_emails(self):
-        """获取并显示邮件"""
-        try:
-            self.statusBar().showMessage("正在获取邮件...")
+        """获取并显示邮件列表"""
+        # 清空当前邮件列表
+        self.email_table.clear_emails()
+        
+        # 更新状态栏
+        self.statusBar().showMessage("正在获取邮件...")
+        
+        # 如果没有连接，先连接邮箱
+        if not self.email_connector.mail:
+            if not self.connect_email():
+                return
+        
+        if self.async_processor:
+            # 使用异步处理器
+            def on_emails_fetched(emails):
+                self.statusBar().showMessage(f"成功获取 {len(emails)} 封邮件")
+                
+                # 分类邮件
+                self.async_processor.classify_emails_async(
+                    emails,
+                    callback=self.display_classified_emails,
+                    error_callback=self.handle_classify_error
+                )
+            
+            def on_fetch_error(error_msg):
+                self.statusBar().showMessage(f"获取邮件失败: {error_msg}")
+                QMessageBox.critical(self, "错误", f"获取邮件失败: {error_msg}")
+            
+            # 异步获取邮件
+            self.async_processor.fetch_emails_async(
+                callback=on_emails_fetched,
+                error_callback=on_fetch_error
+            )
+        else:
+            # 使用同步方式获取邮件
             emails = self.email_connector.fetch_emails()
             
-            # 对邮件列表进行倒序排列
-            emails.reverse()
-            
-            # 清空表格
-            self.email_table.clear_emails()
-            
-            # 添加邮件到表格
-            for email_data in emails:
-                self.email_table.add_email(email_data)
+            if not emails:
+                self.statusBar().showMessage("没有找到邮件")
+                return
                 
             self.statusBar().showMessage(f"成功获取 {len(emails)} 封邮件")
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"获取邮件时出错: {e}")
-            self.statusBar().showMessage("获取邮件失败")
             
+            # 分类邮件
+            for email_data in emails:
+                category = self.email_classifier.classify_email(email_data)
+                self.email_classifier.tag_email(email_data, category)
+                
+                # 添加到邮件列表
+                self.email_table.add_email(email_data)
+    
+    def display_classified_emails(self, emails):
+        """显示已分类的邮件"""
+        for email_data in emails:
+            self.email_table.add_email(email_data)
+        
+        self.statusBar().showMessage(f"已显示 {len(emails)} 封邮件")
+    
+    def handle_classify_error(self, error_msg):
+        """处理分类错误"""
+        self.statusBar().showMessage(f"分类邮件失败: {error_msg}")
+        QMessageBox.warning(self, "警告", f"分类邮件失败: {error_msg}")
+        
     def show_email_content(self, email_data):
         """显示选中邮件的内容"""
         self.current_email = email_data
         
-        # 显示邮件正文
-        self.email_body_text.setText(email_data.get('body', ''))
+        # 设置邮件内容
+        content = f"发件人: {email_data.get('from', '')}\n"
+        content += f"主题: {email_data.get('subject', '')}\n"
+        content += f"日期: {email_data.get('date', '')}\n"
+        content += f"分类: {email_data.get('category', '未分类')}\n\n"
+        content += email_data.get('body', '')
         
-        # 分类邮件并生成回复
-        category = self.email_classifier.classify_email(email_data)
+        self.email_body_text.setText(content)
+        
+        # 设置自动回复内容（使用该分类的模板）
+        category = email_data.get('category', self.config.DEFAULT_CATEGORY)
         reply_content = self.auto_reply_generator.generate_reply(category)
         
-        # 显示自动回复内容
+        # 如果有模板管理器，使用填充变量的模板
+        if self.template_manager:
+            # 查找与该分类匹配的模板
+            matching_templates = self.template_manager.get_templates_by_category(category)
+            if matching_templates:
+                template = matching_templates[0]
+                template_content = template.get("content", "")
+                reply_content = self.template_manager.fill_template(template_content, email_data)
+        
         self.reply_text.setText(reply_content)
+        
+        # 显示附件（如果有附件处理器）
+        if self.attachment_handler and hasattr(self, 'attachment_widget'):
+            self.attachment_widget.set_email(email_data)
+            
+        # 添加到分析（如果有分析器）
+        if self.email_analytics:
+            self.email_analytics.save_email(email_data)
+            
+            # 刷新统计数据
+            if hasattr(self, 'statistics_widget'):
+                self.statistics_widget.refresh()
         
     def send_reply(self):
         """发送回复邮件"""
         if not self.current_email:
-            QMessageBox.warning(self, "警告", "请选择要回复的邮件")
+            QMessageBox.warning(self, "警告", "请先选择要回复的邮件")
             return
             
-        # 获取回复内容
         reply_content = self.reply_text.toPlainText().strip()
         if not reply_content:
             QMessageBox.warning(self, "警告", "回复内容不能为空")
             return
             
+        # 获取收件人和主题
+        recipient = self.current_email.get('from', '')
+        subject = f"Re: {self.current_email.get('subject', '')}"
+        
+        self.statusBar().showMessage("正在发送回复...")
+        
         # 发送邮件
-        if self.email_sender.send_email(
-            recipient=self.current_email['from'],
-            subject=f"Re: {self.current_email['subject']}",
-            body=reply_content,
-            attachments=self.current_email['attachments']
-        ):
-            QMessageBox.information(self, "成功", "邮件发送成功")
+        success = self.email_sender.send_email(
+            recipient=recipient,
+            subject=subject,
+            body=reply_content
+        )
+        
+        if success:
+            self.statusBar().showMessage("回复邮件已发送")
+            QMessageBox.information(self, "成功", "回复邮件已发送")
+            
+            # 更新统计数据
+            if self.email_analytics:
+                self.email_analytics.mark_email_replied(self.current_email.get('id', ''))
+                
+                # 刷新统计数据
+                if hasattr(self, 'statistics_widget'):
+                    self.statistics_widget.refresh()
         else:
-            QMessageBox.critical(self, "错误", "发送邮件时出错")
+            self.statusBar().showMessage("发送回复失败")
+            QMessageBox.warning(self, "警告", "发送回复失败，请检查邮箱连接")
             
     def bulk_classify_emails(self):
         """批量分类邮件"""
         selected_emails = self.email_table.get_selected_emails()
         if not selected_emails:
-            QMessageBox.warning(self, "警告", "请选择要分类的邮件")
+            QMessageBox.warning(self, "警告", "请先选择要分类的邮件")
             return
             
-        target_category = self.bulk_category_combo.currentText()
-        if not target_category:
+        # 获取选择的分类
+        category = self.bulk_category_combo.currentText()
+        if not category:
             QMessageBox.warning(self, "警告", "请选择目标分类")
             return
             
-        # 更新邮件分类
-        success_count = 0
-        for email_data in selected_emails:
-            self.email_classifier.tag_email(email_data, target_category)
-            success_count += 1
+        self.statusBar().showMessage(f"正在将 {len(selected_emails)} 封邮件分类为 {category}...")
+        
+        if self.async_processor:
+            # 使用异步处理器
+            def on_process_complete(processed_emails):
+                # 更新表格中的分类信息
+                for email_data in processed_emails:
+                    self.email_table.add_email(email_data)
+                    
+                    # 保存到分析系统
+                    if self.email_analytics:
+                        self.email_analytics.save_email(email_data)
+                
+                self.statusBar().showMessage(f"已成功将 {len(processed_emails)} 封邮件分类为 {category}")
+                QMessageBox.information(self, "完成", f"已成功将 {len(processed_emails)} 封邮件分类为 {category}")
+                
+                # 刷新统计数据
+                if self.email_analytics and hasattr(self, 'statistics_widget'):
+                    self.statistics_widget.refresh()
             
-        # 刷新邮件列表以显示更新后的分类
-        self.fetch_and_display_emails()
-        
-        QMessageBox.information(self, "成功", f"成功分类 {success_count} 封邮件")
-        
-    def bulk_reply_emails(self):
-        """批量回复邮件"""
+            def on_process_error(error_msg):
+                self.statusBar().showMessage(f"批量分类失败: {error_msg}")
+                QMessageBox.warning(self, "警告", f"批量分类失败: {error_msg}")
+            
+            # 异步批量处理
+            self.async_processor.batch_process_async(
+                selected_emails,
+                target_category=category,
+                callback=on_process_complete,
+                error_callback=on_process_error
+            )
+        else:
+            # 使用同步方式处理
+            try:
+                processed_count = 0
+                for email_data in selected_emails:
+                    # 标记为目标分类
+                    self.email_classifier.tag_email(email_data, category)
+                    
+                    # 更新表格中的分类信息
+                    self.email_table.add_email(email_data)
+                    
+                    # 保存到分析系统
+                    if self.email_analytics:
+                        self.email_analytics.save_email(email_data)
+                    
+                    processed_count += 1
+                    
+                self.statusBar().showMessage(f"已成功将 {processed_count} 封邮件分类为 {category}")
+                QMessageBox.information(self, "完成", f"已成功将 {processed_count} 封邮件分类为 {category}")
+                
+                # 刷新统计数据
+                if self.email_analytics and hasattr(self, 'statistics_widget'):
+                    self.statistics_widget.refresh()
+            except Exception as e:
+                self.statusBar().showMessage(f"批量分类失败: {e}")
+                QMessageBox.warning(self, "警告", f"批量分类失败: {e}")
+                
+    def show_bulk_reply_dialog(self):
+        """显示批量回复对话框"""
         selected_emails = self.email_table.get_selected_emails()
         if not selected_emails:
-            QMessageBox.warning(self, "警告", "请选择要回复的邮件")
+            QMessageBox.warning(self, "警告", "请先选择要回复的邮件")
             return
             
-        reply_content = self.bulk_reply_text.toPlainText().strip()
+        # 创建对话框
+        dialog = QDialog(self)
+        dialog.setWindowTitle("批量回复")
+        dialog.setMinimumWidth(500)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # 添加模板选择（如果有模板管理器）
+        template_combo = None
+        if self.template_manager:
+            template_layout = QHBoxLayout()
+            template_layout.addWidget(QLabel("选择模板:"))
+            
+            template_combo = QComboBox()
+            template_combo.addItem("不使用模板")
+            
+            templates = self.template_manager.get_templates_by_category(None)
+            for template in templates:
+                template_combo.addItem(template.get("name", "未命名"))
+                
+            template_layout.addWidget(template_combo)
+            layout.addLayout(template_layout)
+            
+            # 添加提示
+            layout.addWidget(QLabel("注意: 使用模板时，会为每封邮件填充不同的变量"))
+        
+        # 回复内容
+        layout.addWidget(QLabel("回复内容:"))
+        reply_text = QTextEdit()
+        layout.addWidget(reply_text)
+        
+        # 按钮区域
+        buttons = QHBoxLayout()
+        
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(dialog.reject)
+        buttons.addWidget(cancel_btn)
+        
+        ok_btn = QPushButton("发送")
+        ok_btn.clicked.connect(dialog.accept)
+        buttons.addWidget(ok_btn)
+        
+        layout.addLayout(buttons)
+        
+        # 关联模板选择变更事件
+        if template_combo:
+            def on_template_changed(index):
+                if index > 0:  # 不是"不使用模板"
+                    template_name = template_combo.currentText()
+                    template_content = self.template_manager.get_template_content(template_name)
+                    reply_text.setText(template_content)
+            
+            template_combo.currentIndexChanged.connect(on_template_changed)
+        
+        # 显示对话框
+        result = dialog.exec()
+        
+        if result == QDialog.DialogCode.Accepted:
+            content = reply_text.toPlainText().strip()
+            
+            if not content:
+                QMessageBox.warning(self, "警告", "回复内容不能为空")
+                return
+            
+            # 如果选择了模板，则执行批量回复时使用变量替换
+            use_template = False
+            template_name = None
+            if template_combo and template_combo.currentIndex() > 0:
+                use_template = True
+                template_name = template_combo.currentText()
+                template_content = self.template_manager.get_template_content(template_name)
+            
+            # 执行批量回复
+            self.bulk_reply_emails(selected_emails, content, use_template, template_name)
+    
+    def bulk_reply_emails(self, selected_emails=None, reply_content=None, use_template=False, template_name=None):
+        """批量回复邮件
+        
+        Args:
+            selected_emails: 选中的邮件列表，如果为None则从表格获取
+            reply_content: 回复内容，如果为None则从批量回复文本框获取
+            use_template: 是否使用模板
+            template_name: 模板名称
+        """
+        if selected_emails is None:
+            selected_emails = self.email_table.get_selected_emails()
+            
+        if not selected_emails:
+            QMessageBox.warning(self, "警告", "请先选择要回复的邮件")
+            return
+            
+        if reply_content is None:
+            reply_content = self.bulk_reply_text.toPlainText()
+            
         if not reply_content:
             QMessageBox.warning(self, "警告", "请输入回复内容")
             return
             
-        # 发送回复
+        self.statusBar().showMessage(f"正在回复 {len(selected_emails)} 封邮件...")
+        
+        # 执行批量回复
         success_count = 0
         for email_data in selected_emails:
-            if self.email_sender.send_email(
-                recipient=email_data['from'],
-                subject=f"Re: {email_data['subject']}",
-                body=reply_content,
-                attachments=email_data['attachments']
-            ):
-                success_count += 1
+            try:
+                # 如果使用模板，则为每封邮件填充变量
+                actual_content = reply_content
+                if use_template and self.template_manager:
+                    template_content = self.template_manager.get_template_content(template_name)
+                    actual_content = self.template_manager.fill_template(template_content, email_data)
                 
-        QMessageBox.information(self, "成功", f"成功发送 {success_count} 封回复邮件")
+                # 发送回复
+                recipient = email_data.get('from', '')
+                subject = f"Re: {email_data.get('subject', '')}"
+                
+                if self.email_sender.send_email(recipient, subject, actual_content):
+                    success_count += 1
+                    
+                    # 标记为已回复（如果有分析器）
+                    if self.email_analytics:
+                        self.email_analytics.mark_email_replied(email_data.get('id', ''))
+            except Exception as e:
+                print(f"回复邮件失败: {e}")
+                
+        if success_count > 0:
+            self.statusBar().showMessage(f"已成功回复 {success_count} 封邮件")
+            QMessageBox.information(self, "完成", f"已成功回复 {success_count} 封邮件")
+            
+            # 刷新统计数据
+            if self.email_analytics and hasattr(self, 'statistics_widget'):
+                self.statistics_widget.refresh()
+        else:
+            self.statusBar().showMessage("批量回复失败")
+            QMessageBox.warning(self, "警告", "批量回复失败，请检查邮箱连接")
         
     def show_bulk_classify_dialog(self):
         """显示批量分类对话框"""
@@ -622,17 +925,6 @@ class EmailAssistantGUI(QMainWindow):
         # 这里可以实现一个更复杂的分类对话框
         # 目前简单调用批量分类方法
         self.bulk_classify_emails()
-        
-    def show_bulk_reply_dialog(self):
-        """显示批量回复对话框"""
-        selected_emails = self.email_table.get_selected_emails()
-        if not selected_emails:
-            QMessageBox.warning(self, "警告", "请选择要回复的邮件")
-            return
-            
-        # 这里可以实现一个更复杂的回复对话框
-        # 目前简单调用批量回复方法
-        self.bulk_reply_emails()
         
     def delete_selected_emails(self):
         """删除选中的邮件"""
@@ -671,11 +963,26 @@ class EmailAssistantGUI(QMainWindow):
         # 其他选择逻辑需要实现更多函数
             
     def change_theme(self, index):
-        """更改主题"""
-        if hasattr(self, 'theme_manager') and self.theme_manager:
-            theme = "dark" if index == 1 else "light"
-            self.theme_manager.apply_theme(theme)
-            self.statusBar().showMessage(f"已切换到{'深色' if index == 1 else '浅色'}主题")
+        """切换界面主题
+        
+        Args:
+            index: 选择的索引，0=浅色，1=深色
+        """
+        if not self.theme_manager:
+            # 如果主题管理器未初始化，则初始化它
+            app = QApplication.instance()
+            if app:
+                self.theme_manager = ThemeManager(app)
+            else:
+                return
+                
+        theme = "light" if index == 0 else "dark"
+        success = self.theme_manager.apply_theme(theme)
+        
+        if success:
+            self.statusBar().showMessage(f"已切换到{theme}主题")
+        else:
+            self.statusBar().showMessage(f"切换主题失败")
         
     def reply_selected_email(self):
         """快捷键回复邮件"""
@@ -707,6 +1014,214 @@ class EmailAssistantGUI(QMainWindow):
         except Exception as e:
             print(f"关闭邮箱连接时出错: {e}")
         event.accept()
+
+    def create_template_management_tab(self):
+        """创建模板管理标签页"""
+        template_tab = QWidget()
+        layout = QVBoxLayout(template_tab)
+        
+        # 模板列表和编辑区域
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # 左侧：模板列表
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        
+        # 模板列表标题和过滤
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("分类:"))
+        
+        self.template_filter_combo = QComboBox()
+        self.template_filter_combo.addItem("全部")
+        if self.template_manager:
+            for category in self.template_manager.get_all_categories():
+                self.template_filter_combo.addItem(category)
+        self.template_filter_combo.currentIndexChanged.connect(self.filter_templates)
+        filter_layout.addWidget(self.template_filter_combo)
+        
+        left_layout.addLayout(filter_layout)
+        
+        # 模板列表
+        self.template_list = QListWidget()
+        self.template_list.itemClicked.connect(self.load_template)
+        left_layout.addWidget(self.template_list)
+        
+        # 刷新模板列表
+        self.refresh_templates_list()
+        
+        # 按钮区域
+        buttons_layout = QHBoxLayout()
+        
+        self.add_template_btn = QPushButton("添加模板")
+        self.add_template_btn.clicked.connect(self.add_new_template)
+        buttons_layout.addWidget(self.add_template_btn)
+        
+        self.delete_template_btn = QPushButton("删除模板")
+        self.delete_template_btn.clicked.connect(self.delete_template)
+        buttons_layout.addWidget(self.delete_template_btn)
+        
+        left_layout.addLayout(buttons_layout)
+        
+        splitter.addWidget(left_widget)
+        
+        # 右侧：模板编辑
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        
+        # 模板信息
+        form_layout = QGridLayout()
+        
+        form_layout.addWidget(QLabel("模板名称:"), 0, 0)
+        self.template_name_edit = QLineEdit()
+        form_layout.addWidget(self.template_name_edit, 0, 1)
+        
+        form_layout.addWidget(QLabel("模板分类:"), 1, 0)
+        self.template_category_edit = QLineEdit()
+        form_layout.addWidget(self.template_category_edit, 1, 1)
+        
+        right_layout.addLayout(form_layout)
+        
+        # 模板内容
+        right_layout.addWidget(QLabel("模板内容:"))
+        self.template_content_edit = QTextEdit()
+        right_layout.addWidget(self.template_content_edit)
+        
+        # 保存按钮
+        self.save_template_btn = QPushButton("保存模板")
+        self.save_template_btn.clicked.connect(self.save_template)
+        right_layout.addWidget(self.save_template_btn)
+        
+        splitter.addWidget(right_widget)
+        
+        # 设置初始分割大小
+        splitter.setSizes([300, 500])
+        
+        layout.addWidget(splitter)
+        
+        return template_tab
+    
+    def refresh_templates_list(self, filter_category=None):
+        """刷新模板列表"""
+        if not self.template_manager:
+            return
+            
+        self.template_list.clear()
+        
+        templates = self.template_manager.get_templates_by_category(filter_category)
+        
+        for template in templates:
+            item = QListWidgetItem(template.get("name", "未命名"))
+            item.setData(Qt.ItemDataRole.UserRole, template.get("name"))
+            self.template_list.addItem(item)
+    
+    def refresh_templates_combo(self):
+        """刷新回复区域的模板下拉列表"""
+        if not self.template_manager:
+            return
+            
+        self.template_combo.clear()
+        self.template_combo.addItem("选择模板...")
+        
+        templates = self.template_manager.get_templates_by_category(None)
+        
+        for template in templates:
+            self.template_combo.addItem(template.get("name", "未命名"))
+    
+    def filter_templates(self, index):
+        """根据选择的分类过滤模板列表"""
+        category = None
+        if index > 0:  # 0 是 "全部"
+            category = self.template_filter_combo.currentText()
+        
+        self.refresh_templates_list(category)
+    
+    def load_template(self, item):
+        """加载选中的模板到编辑区域"""
+        if not self.template_manager:
+            return
+            
+        template_name = item.data(Qt.ItemDataRole.UserRole)
+        template = self.template_manager.get_template(template_name)
+        
+        if template:
+            self.template_name_edit.setText(template.get("name", ""))
+            self.template_category_edit.setText(template.get("category", ""))
+            self.template_content_edit.setText(template.get("content", ""))
+    
+    def add_new_template(self):
+        """添加新模板"""
+        self.template_name_edit.clear()
+        self.template_category_edit.clear()
+        self.template_content_edit.clear()
+        
+        # 给一个默认模板名
+        import datetime
+        self.template_name_edit.setText(f"新模板_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}")
+    
+    def save_template(self):
+        """保存当前编辑的模板"""
+        if not self.template_manager:
+            return
+            
+        name = self.template_name_edit.text().strip()
+        category = self.template_category_edit.text().strip()
+        content = self.template_content_edit.toPlainText()
+        
+        if not name:
+            QMessageBox.warning(self, "保存失败", "模板名称不能为空")
+            return
+        
+        success = self.template_manager.save_template(name, content, category)
+        
+        if success:
+            QMessageBox.information(self, "保存成功", "模板已保存")
+            self.refresh_templates_list()
+            self.refresh_templates_combo()
+        else:
+            QMessageBox.warning(self, "保存失败", "保存模板时出错")
+    
+    def delete_template(self):
+        """删除选中的模板"""
+        if not self.template_manager:
+            return
+            
+        selected_items = self.template_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "删除失败", "请先选择要删除的模板")
+            return
+        
+        template_name = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        
+        reply = QMessageBox.question(self, "确认删除", 
+                                    f"确定要删除模板 '{template_name}' 吗？",
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            success = self.template_manager.delete_template(template_name)
+            
+            if success:
+                QMessageBox.information(self, "删除成功", "模板已删除")
+                self.refresh_templates_list()
+                self.refresh_templates_combo()
+            else:
+                QMessageBox.warning(self, "删除失败", "删除模板时出错")
+    
+    def apply_selected_template(self, index):
+        """应用选中的模板到回复内容"""
+        if index <= 0 or not self.template_manager:  # 0 是 "选择模板..."
+            return
+            
+        template_name = self.template_combo.currentText()
+        
+        if not self.current_email:
+            self.reply_text.setText(self.template_manager.get_template_content(template_name))
+            return
+            
+        # 填充模板变量
+        template_content = self.template_manager.get_template_content(template_name)
+        filled_content = self.template_manager.fill_template(template_content, self.current_email)
+        
+        self.reply_text.setText(filled_content)
 
 
 # 添加这个函数以便在测试时可以单独运行此文件

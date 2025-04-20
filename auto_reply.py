@@ -1,7 +1,12 @@
 import config
 
 class AutoReplyGenerator:
-    def __init__(self, config):
+    def __init__(self, config=None):
+        # 如果没有提供config参数，则自动加载
+        if config is None:
+            from config import load_config
+            config = load_config()
+            
         self.config = config
 
     def generate_reply(self, category):

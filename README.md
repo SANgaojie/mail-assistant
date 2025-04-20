@@ -11,16 +11,30 @@
 - **批量处理**：支持对多封邮件进行批量分类和回复。
 - **现代界面**：提供美观、直观的PyQt6图形用户界面，支持浅色/深色主题切换。
 - **快捷键支持**：支持常用操作的快捷键，提高操作效率。
+- **附件处理**：支持邮件附件的查看和保存。
+- **模板管理**：提供模板管理功能，支持自定义回复模板。
+- **异步操作**：支持邮件异步处理，提高操作响应速度。
+- **数据分析**：支持对邮件数据进行统计分析。
 
 ## 项目结构
 ```
+├── async_operations.py   # 异步操作处理模块
+├── attachment_handler.py # 附件处理模块
+├── attachments/          # 附件存储目录
 ├── auto_reply.py         # 自动回复生成模块
 ├── config.py             # 配置文件，包含邮箱和分类相关配置
+├── email_analytics.py    # 邮件数据分析模块
 ├── email_classifier.py   # 邮件分类模块
 ├── email_connector.py    # 邮箱连接和邮件获取模块
+├── email_data.db         # 邮件数据存储数据库
 ├── email_sender.py       # 邮件发送模块
 ├── gui_pyqt6.py          # PyQt6图形用户界面模块
+├── icons/                # 应用图标目录
+├── image/                # 图片资源目录
 ├── main.py               # 主程序入口
+├── requirements.txt      # 项目依赖库列表
+├── template_manager.py   # 模板管理模块
+├── templates/            # 模板存储目录
 └── README.md             # 项目说明文档
 ```
 

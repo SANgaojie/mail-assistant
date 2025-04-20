@@ -4,7 +4,12 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 
 class EmailSender:
-    def __init__(self, config):
+    def __init__(self, config=None):
+        # 如果没有提供config参数，则自动加载
+        if config is None:
+            from config import load_config
+            config = load_config()
+            
         self.config = config
 
     def send_email(self, recipient, subject, body, attachments=None):

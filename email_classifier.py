@@ -7,7 +7,12 @@ nltk.download('punkt')
 nltk.download('stopwords')
 
 class EmailClassifier:
-    def __init__(self, config):
+    def __init__(self, config=None):
+        # 如果没有提供config参数，则自动加载
+        if config is None:
+            from config import load_config
+            config = load_config()
+            
         self.stop_words = set(stopwords.words('english'))
         self.category_keywords = config.CATEGORY_KEYWORDS
         self.default_category = config.DEFAULT_CATEGORY
