@@ -116,6 +116,8 @@ class ThreadPool:
         Returns:
             任务ID
         """
+        # 打印调试信息
+        print(f"提交任务: {func.__name__}, 参数: {args}, 命名参数: {kwargs}")
         task_id = id(func) + int(time.time() * 1000)
         self.tasks.put((task_id, func, callback, error_callback, args, kwargs))
         return task_id
@@ -135,16 +137,21 @@ class ThreadPool:
                 
                 try:
                     # 执行任务
+                    print(f"执行任务: {func.__name__}, args: {args}, kwargs: {kwargs}")
                     result = func(*args, **kwargs)
                     
                     # 如果有回调，执行回调
                     if callback:
                         callback(result)
                 except Exception as e:
+                    print(f"任务执行出错: {e}")
                     # 如果有错误回调，执行错误回调
                     if error_callback:
                         error_callback(str(e))
             except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"工作线程意外错误: {e}")
                 continue
 
 
@@ -188,20 +195,73 @@ class AsyncEmailProcessor:
             if callback:
                 callback(cached_result)
             return None
+        
+        # 确保邮箱已连接
+        if not self.email_connector.mail:
+            # 尝试重新连接邮箱
+            print("邮箱未连接，尝试重新连接...")
+            if not self.email_connector.connect():
+                if error_callback:
+                    error_callback("邮箱连接失败，请重新登录")
+                return None
+        
+        def fetch_emails_wrapper():
+            """包装获取邮件方法，确保使用已连接的实例，并添加重试机制"""
+            # 添加重试机制
+            max_retries = 3
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    # 检查连接是否有效
+                    if not self.email_connector.mail:
+                        print(f"重试 {retry_count+1}/{max_retries}: 邮箱未连接，尝试重新连接")
+                        if not self.email_connector.connect():
+                            retry_count += 1
+                            continue
+                    
+                    # 尝试获取邮件
+                    result = self.email_connector.fetch_emails(folder=folder, search_criteria=search_criteria)
+                    
+                    # 如果成功获取邮件，返回结果
+                    if result:
+                        return result
+                    
+                    # 如果没有获取到邮件，但没有异常，也算成功（可能就是没有邮件）
+                    if result is not None and len(result) == 0:
+                        return []
+                        
+                    # 此时获取邮件失败，但没有引发异常，重试
+                    print(f"重试 {retry_count+1}/{max_retries}: 获取邮件失败但未引发异常")
+                    retry_count += 1
+                    
+                except Exception as e:
+                    print(f"重试 {retry_count+1}/{max_retries}: 获取邮件出错: {e}")
+                    # 出错了，重置连接
+                    try:
+                        self.email_connector.close()
+                    except:
+                        pass
+                        
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        raise Exception(f"获取邮件失败，已重试 {max_retries} 次: {e}")
+            
+            # 所有重试都失败
+            raise Exception(f"获取邮件失败，已重试 {max_retries} 次")
             
         def cache_result_callback(result):
             # 缓存结果
-            self.cache.put(cache_key, result)
+            if result:  # 只缓存非空结果
+                self.cache.put(cache_key, result)
             # 调用原回调
             if callback:
                 callback(result)
                 
         return self.thread_pool.submit(
-            self.email_connector.fetch_emails,
-            cache_result_callback,
-            error_callback,
-            folder,
-            search_criteria
+            fetch_emails_wrapper,  # 使用包装函数而不是直接使用email_connector.fetch_emails
+            callback=cache_result_callback,
+            error_callback=error_callback
         )
         
     def classify_emails_async(self, emails, callback=None, error_callback=None):
@@ -262,32 +322,57 @@ class AsyncEmailProcessor:
         Returns:
             任务ID
         """
-        def batch_process(emails, target_category, reply_content):
-            processed = []
-            for email_data in emails:
-                try:
-                    # 分类邮件
-                    if target_category:
-                        email_data = self.email_classifier.tag_email(email_data, target_category)
+        # 添加日志
+        print(f"开始批量处理 {len(emails)} 封邮件，目标分类: {target_category}")
+        
+        try:
+            def batch_process(emails_to_process, target_cat, reply_text):
+                """实际处理邮件的函数
+                注意参数名称不要与外部函数参数冲突
+                """
+                processed = []
+                total = len(emails_to_process)
+                
+                for i, email_data in enumerate(emails_to_process):
+                    try:
+                        print(f"处理邮件 {i+1}/{total}，ID: {email_data.get('id', '无ID')}")
                         
-                    # 添加到分析
-                    if self.analytics:
-                        self.analytics.save_email(email_data)
-                    
-                    processed.append(email_data)
-                except Exception as e:
-                    print(f"处理邮件失败: {e}")
-                    
-            return processed
+                        # 复制一份邮件数据，避免直接修改原数据
+                        email_copy = email_data.copy()
+                        
+                        # 分类邮件
+                        if target_cat:
+                            email_copy = self.email_classifier.tag_email(email_copy, target_cat)
+                            print(f"邮件已标记为类别: {target_cat}")
+                            
+                        # 添加到分析
+                        if self.analytics:
+                            self.analytics.save_email(email_copy)
+                            print(f"已保存到分析系统")
+                        
+                        processed.append(email_copy)
+                    except Exception as e:
+                        print(f"处理邮件失败: {e}")
+                        # 继续处理下一封邮件，不中断整个过程
+                
+                print(f"批量处理完成，成功处理 {len(processed)}/{total} 封邮件")
+                return processed
+                
+            # 使用正确的参数顺序调用thread_pool.submit
+            return self.thread_pool.submit(
+                batch_process,  # 处理函数
+                callback=callback,  # 回调函数 
+                error_callback=error_callback,  # 错误回调
+                emails_to_process=emails,  # 参数1: 邮件列表
+                target_cat=target_category,  # 参数2: 目标分类
+                reply_text=reply_content  # 参数3: 回复内容
+            )
             
-        return self.thread_pool.submit(
-            batch_process,
-            callback,
-            error_callback,
-            emails,
-            target_category,
-            reply_content
-        )
+        except Exception as e:
+            print(f"启动批量处理任务失败: {e}")
+            if error_callback:
+                error_callback(f"启动处理失败: {e}")
+            return None
         
     def invalidate_cache(self, pattern=None):
         """使缓存无效

@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QCheckBox, QSplitter, QTableWidget, QTableWidgetItem, QHeaderView,
                              QTabWidget, QMessageBox, QFileDialog, QListWidget, QListWidgetItem,
                              QDialog)
-from PyQt6.QtCore import Qt, QSize, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import Qt, QSize, pyqtSignal, pyqtSlot, QTimer
 from PyQt6.QtGui import QIcon, QFont, QPixmap, QColor, QPalette
 
 import config
@@ -59,9 +59,14 @@ class ThemeManager:
         
         # 设置应用样式表
         self.app.setStyleSheet(f"""
+            * {{
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "WenQuanYi Micro Hei", sans-serif;
+            }}
+            
             QWidget {{
                 background-color: {theme["background"]};
                 color: {theme["text"]};
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "WenQuanYi Micro Hei", sans-serif;
             }}
             
             #sidebar {{
@@ -75,6 +80,7 @@ class ThemeManager:
                 border: none;
                 padding: 8px 16px;
                 border-radius: 4px;
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "WenQuanYi Micro Hei", sans-serif;
             }}
             
             QPushButton:hover {{
@@ -86,6 +92,7 @@ class ThemeManager:
                 border: 1px solid {theme["border"]};
                 border-radius: 4px;
                 padding: 8px;
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "WenQuanYi Micro Hei", sans-serif;
             }}
             
             QGroupBox {{
@@ -93,6 +100,7 @@ class ThemeManager:
                 border-radius: 4px;
                 margin-top: 1em;
                 font-weight: bold;
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "WenQuanYi Micro Hei", sans-serif;
             }}
             
             QGroupBox::title {{
@@ -104,6 +112,7 @@ class ThemeManager:
             QTableWidget {{
                 border: 1px solid {theme["border"]};
                 gridline-color: {theme["border"]};
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "WenQuanYi Micro Hei", sans-serif;
             }}
             
             QTableWidget::item:selected {{
@@ -115,6 +124,31 @@ class ThemeManager:
                 padding: 4px;
                 border: 1px solid {theme["border"]};
                 font-weight: bold;
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "WenQuanYi Micro Hei", sans-serif;
+            }}
+            
+            QTabWidget::tab-bar {{
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "WenQuanYi Micro Hei", sans-serif;
+            }}
+            
+            QTabBar::tab {{
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "WenQuanYi Micro Hei", sans-serif;
+            }}
+            
+            QMenu {{
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "WenQuanYi Micro Hei", sans-serif;
+            }}
+            
+            QLabel {{
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "WenQuanYi Micro Hei", sans-serif;
+            }}
+            
+            QStatusBar, QMessageBox, QDialog {{
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "WenQuanYi Micro Hei", sans-serif;
+            }}
+            
+            QToolTip {{
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "WenQuanYi Micro Hei", sans-serif;
             }}
         """)
         
@@ -307,6 +341,23 @@ class EmailAssistantGUI(QMainWindow):
         app = QApplication.instance()
         if app:
             self.theme_manager = ThemeManager(app)
+            
+            # 设置默认字体 - 确保中文显示正常
+            from PyQt6.QtGui import QFont
+            font_families = ["Microsoft YaHei UI", "Microsoft YaHei", "SimSun", "WenQuanYi Micro Hei"]
+            
+            # 尝试设置一个可用的中文字体
+            app_font = None
+            for family in font_families:
+                font = QFont(family, 9)
+                if font.exactMatch():  # 检查字体是否可用
+                    app_font = font
+                    print(f"使用字体: {family}")
+                    break
+            
+            if app_font:
+                self.setFont(app_font)  # 为当前窗口设置字体
+            
             # 默认应用浅色主题
             self.theme_manager.apply_theme("light")
         else:
@@ -548,17 +599,37 @@ class EmailAssistantGUI(QMainWindow):
             self.config.SMTP_SERVER = smtp_server
             self.config.SMTP_PORT = smtp_port
             
+            # 保存当前异步处理器引用
+            old_async_processor = self.async_processor
+            
             # 重新初始化连接器
             self.email_connector = EmailConnector(self.config)
             self.email_sender = EmailSender(self.config)
             
+            # 重新初始化异步处理器，使其使用新的连接器
+            if old_async_processor:
+                # 关闭旧的处理器
+                old_async_processor.close()
+                # 创建新的处理器，保持analytics引用
+                from async_operations import AsyncEmailProcessor
+                self.async_processor = AsyncEmailProcessor(
+                    email_connector=self.email_connector,
+                    email_classifier=self.email_classifier,
+                    analytics=getattr(old_async_processor, 'analytics', None)
+                )
+            
+            # 连接邮箱
             if self.email_connector.connect():
                 QMessageBox.information(self, "成功", "邮箱连接成功")
+                # 立即获取邮件列表
                 self.fetch_and_display_emails()
+                return True
             else:
                 QMessageBox.critical(self, "错误", "邮箱连接失败")
+                return False
         except Exception as e:
             QMessageBox.critical(self, "错误", f"邮箱连接失败: {e}")
+            return False
             
     def fetch_and_display_emails(self):
         """获取并显示邮件列表"""
@@ -570,12 +641,19 @@ class EmailAssistantGUI(QMainWindow):
         
         # 如果没有连接，先连接邮箱
         if not self.email_connector.mail:
+            self.statusBar().showMessage("邮箱未连接，尝试连接...")
             if not self.connect_email():
+                self.statusBar().showMessage("邮箱连接失败，请检查设置并重试")
                 return
+            self.statusBar().showMessage("已重新连接邮箱，正在获取邮件...")
         
         if self.async_processor:
             # 使用异步处理器
             def on_emails_fetched(emails):
+                if not emails:
+                    self.statusBar().showMessage("没有发现邮件")
+                    return
+                    
                 self.statusBar().showMessage(f"成功获取 {len(emails)} 封邮件")
                 
                 # 分类邮件
@@ -588,6 +666,17 @@ class EmailAssistantGUI(QMainWindow):
             def on_fetch_error(error_msg):
                 self.statusBar().showMessage(f"获取邮件失败: {error_msg}")
                 QMessageBox.critical(self, "错误", f"获取邮件失败: {error_msg}")
+                
+                # 提示用户重新连接
+                reply = QMessageBox.question(
+                    self, 
+                    "连接问题", 
+                    "邮箱连接可能已失效，是否重新连接?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.connect_email()
             
             # 异步获取邮件
             self.async_processor.fetch_emails_async(
@@ -721,20 +810,33 @@ class EmailAssistantGUI(QMainWindow):
         if self.async_processor:
             # 使用异步处理器
             def on_process_complete(processed_emails):
-                # 更新表格中的分类信息
-                for email_data in processed_emails:
-                    self.email_table.add_email(email_data)
-                    
-                    # 保存到分析系统
-                    if self.email_analytics:
-                        self.email_analytics.save_email(email_data)
+                # 确保在主线程中处理UI更新
+                def update_ui():
+                    try:
+                        # 更新表格中的分类信息
+                        for email_data in processed_emails:
+                            self.email_table.add_email(email_data)
+                            
+                        self.statusBar().showMessage(f"已成功将 {len(processed_emails)} 封邮件分类为 {category}")
+                        
+                        # 使用另一个延时函数显示完成对话框
+                        def show_message():
+                            try:
+                                QMessageBox.information(self, "完成", f"已成功将 {len(processed_emails)} 封邮件分类为 {category}")
+                            except Exception as e:
+                                print(f"显示消息框时出错: {e}")
+                        
+                        # 延迟显示消息框，确保UI已完全更新
+                        QTimer.singleShot(200, show_message)
+                        
+                        # 刷新统计数据
+                        if hasattr(self, 'statistics_widget'):
+                            self.statistics_widget.refresh()
+                    except Exception as e:
+                        print(f"更新UI时出错: {e}")
                 
-                self.statusBar().showMessage(f"已成功将 {len(processed_emails)} 封邮件分类为 {category}")
-                QMessageBox.information(self, "完成", f"已成功将 {len(processed_emails)} 封邮件分类为 {category}")
-                
-                # 刷新统计数据
-                if self.email_analytics and hasattr(self, 'statistics_widget'):
-                    self.statistics_widget.refresh()
+                # 使用QTimer确保在主线程中执行UI更新
+                QTimer.singleShot(0, update_ui)
             
             def on_process_error(error_msg):
                 self.statusBar().showMessage(f"批量分类失败: {error_msg}")
@@ -917,15 +1019,125 @@ class EmailAssistantGUI(QMainWindow):
         
     def show_bulk_classify_dialog(self):
         """显示批量分类对话框"""
-        selected_emails = self.email_table.get_selected_emails()
-        if not selected_emails:
-            QMessageBox.warning(self, "警告", "请选择要分类的邮件")
-            return
+        try:
+            # 先检查是否选择了邮件
+            selected_emails = self.email_table.get_selected_emails()
+            if not selected_emails:
+                QMessageBox.warning(self, "警告", "请先选择要分类的邮件")
+                return
+                
+            # 使用对话框让用户选择分类
+            categories = ["订单", "投诉", "反馈", "支持", "咨询", "通知", "其他"]
             
-        # 这里可以实现一个更复杂的分类对话框
-        # 目前简单调用批量分类方法
-        self.bulk_classify_emails()
-        
+            # 尝试从config中获取分类
+            if hasattr(self, 'config') and hasattr(self.config, 'CATEGORY_KEYWORDS'):
+                categories = list(self.config.CATEGORY_KEYWORDS.keys())
+                
+            # 如果有模板管理器，尝试获取所有模板分类
+            if self.template_manager:
+                template_categories = self.template_manager.get_all_categories()
+                # 合并类别列表，确保不重复
+                for cat in template_categories:
+                    if cat and cat not in categories:
+                        categories.append(cat)
+            
+            # 创建对话框
+            dialog = QDialog(self)
+            dialog.setWindowTitle("批量分类")
+            dialog.setMinimumWidth(300)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # 添加分类选择
+            layout.addWidget(QLabel(f"将选中的 {len(selected_emails)} 封邮件分类为:"))
+            category_combo = QComboBox()
+            for category in categories:
+                category_combo.addItem(category)
+            layout.addWidget(category_combo)
+            
+            # 按钮区域
+            buttons = QHBoxLayout()
+            
+            cancel_btn = QPushButton("取消")
+            cancel_btn.clicked.connect(dialog.reject)
+            buttons.addWidget(cancel_btn)
+            
+            ok_btn = QPushButton("确定")
+            ok_btn.clicked.connect(dialog.accept)
+            buttons.addWidget(ok_btn)
+            
+            layout.addLayout(buttons)
+            
+            # 显示对话框并等待结果
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                # 用户点击了确定
+                category = category_combo.currentText()
+                # 使用try/except包装批量分类调用
+                try:
+                    self.statusBar().showMessage(f"正在分类... 请稍候")
+                    QApplication.processEvents()  # 确保UI更新
+                    
+                    # 执行批量分类 - 设置1秒超时后再执行，让UI有时间更新
+                    QTimer.singleShot(100, lambda: self._execute_bulk_classify(selected_emails, category))
+                except Exception as e:
+                    self.statusBar().showMessage(f"批量分类出错: {e}")
+                    QMessageBox.critical(self, "错误", f"批量分类失败: {e}")
+        except Exception as e:
+            print(f"显示批量分类对话框出错: {e}")
+            QMessageBox.critical(self, "错误", f"打开批量分类对话框失败: {e}")
+            
+    def _execute_bulk_classify(self, emails, category):
+        """实际执行批量分类的函数(由定时器调用)"""
+        try:
+            if self.async_processor:
+                # 使用异步处理器
+                def on_process_complete(processed_emails):
+                    # 确保在主线程中处理UI更新
+                    def update_ui():
+                        try:
+                            # 更新表格中的分类信息
+                            for email_data in processed_emails:
+                                self.email_table.add_email(email_data)
+                                
+                            self.statusBar().showMessage(f"已成功将 {len(processed_emails)} 封邮件分类为 {category}")
+                            
+                            # 使用另一个延时函数显示完成对话框
+                            def show_message():
+                                try:
+                                    QMessageBox.information(self, "完成", f"已成功将 {len(processed_emails)} 封邮件分类为 {category}")
+                                except Exception as e:
+                                    print(f"显示消息框时出错: {e}")
+                            
+                            # 延迟显示消息框，确保UI已完全更新
+                            QTimer.singleShot(200, show_message)
+                            
+                            # 刷新统计数据
+                            if hasattr(self, 'statistics_widget'):
+                                self.statistics_widget.refresh()
+                        except Exception as e:
+                            print(f"更新UI时出错: {e}")
+                    
+                    # 使用QTimer确保在主线程中执行UI更新
+                    QTimer.singleShot(0, update_ui)
+                
+                def on_process_error(error_msg):
+                    self.statusBar().showMessage(f"批量分类失败: {error_msg}")
+                    QMessageBox.warning(self, "警告", f"批量分类失败: {error_msg}")
+                
+                # 异步批量处理
+                self.async_processor.batch_process_async(
+                    emails,
+                    target_category=category,
+                    callback=on_process_complete,
+                    error_callback=on_process_error
+                )
+            else:
+                # 同步处理
+                self.bulk_classify_emails()
+        except Exception as e:
+            self.statusBar().showMessage(f"批量分类出错: {e}")
+            QMessageBox.critical(self, "错误", f"批量分类失败: {e}")
+    
     def delete_selected_emails(self):
         """删除选中的邮件"""
         selected_emails = self.email_table.get_selected_emails()

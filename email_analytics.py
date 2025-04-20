@@ -8,6 +8,45 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel
 from PyQt6.QtCore import Qt
+import matplotlib
+
+# 配置matplotlib支持中文显示
+def configure_matplotlib_chinese():
+    """配置matplotlib支持中文字体"""
+    # 尝试加载中文字体
+    chinese_fonts = [
+        'Microsoft YaHei', 'SimHei', 'SimSun', 'NSimSun', 'FangSong', 'KaiTi',  # Windows
+        'WenQuanYi Micro Hei', 'WenQuanYi Zen Hei',  # Linux
+        'PingFang SC', 'STHeiti', 'Heiti SC',  # macOS
+        'Noto Sans CJK SC', 'Source Han Sans CN',  # 跨平台开源字体
+    ]
+    
+    # 检查可用的字体
+    from matplotlib.font_manager import FontProperties, findSystemFonts, FontManager
+    font_manager = FontManager()
+    available_fonts = [f.name for f in font_manager.ttflist]
+    
+    found_font = None
+    for font in chinese_fonts:
+        if font in available_fonts:
+            found_font = font
+            break
+    
+    if found_font:
+        print(f"使用中文字体: {found_font}")
+        # 设置matplotlib的字体
+        plt.rcParams['font.sans-serif'] = [found_font, 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False  # 正确显示负号
+    else:
+        print("警告: 未找到可用的中文字体，图表中的中文可能无法正确显示")
+        
+    # 为不支持中文的环境提供备用方案
+    matplotlib.rcParams['axes.formatter.use_locale'] = True
+    import locale
+    locale.setlocale(locale.LC_ALL, '')
+
+# 初始化时配置字体
+configure_matplotlib_chinese()
 
 class EmailAnalytics:
     """邮件分析统计类"""
@@ -222,7 +261,28 @@ class EmailAnalytics:
             cursor.execute(query, params)
             results = cursor.fetchall()
             
-            distribution = {category: count for category, count in results}
+            # 确保有默认分类
+            distribution = {}
+            for category, count in results:
+                # 处理空类别或None类别
+                if not category or category.strip() == '':
+                    category = '未分类'
+                
+                # 合并相同类别
+                if category in distribution:
+                    distribution[category] += count
+                else:
+                    distribution[category] = count
+            
+            # 确保至少有一个类别
+            if not distribution:
+                # 查询总邮件数
+                cursor.execute("SELECT COUNT(*) FROM emails")
+                total_count = cursor.fetchone()[0]
+                
+                if total_count > 0:
+                    distribution['其他'] = total_count
+            
             return distribution
         except Exception as e:
             print(f"获取分类分布数据失败: {e}")
@@ -254,9 +314,9 @@ class EmailAnalytics:
                 date_list.append(current_date.strftime("%Y-%m-%d"))
                 current_date += datetime.timedelta(days=1)
             
-            # 查询每日邮件数量
+            # 使用 strftime 函数处理日期 - 更可靠的 SQL 方法
             cursor.execute('''
-            SELECT SUBSTR(date, 1, 10) as day, COUNT(*) as count
+            SELECT strftime('%Y-%m-%d', date) as day, COUNT(*) as count
             FROM emails
             WHERE date >= ?
             GROUP BY day
@@ -264,18 +324,23 @@ class EmailAnalytics:
             
             results = cursor.fetchall()
             
-            # 填充结果
+            # 处理结果填充到日期列表
             daily_counts = {date: 0 for date in date_list}
+            
             for day, count in results:
                 if day in daily_counts:
                     daily_counts[day] = count
+                else:
+                    # 日期格式可能不同，打印日志
+                    print(f"警告: 日期格式不匹配: {day}")
             
             return daily_counts
         except Exception as e:
             print(f"获取每日邮件数量失败: {e}")
-            return {}
+            return {date: 0 for date in date_list} if 'date_list' in locals() else {}
         finally:
-            conn.close()
+            if 'conn' in locals() and conn:
+                conn.close()
     
     def get_response_time_stats(self):
         """获取回复时间统计
@@ -379,7 +444,14 @@ class EmailAnalytics:
     
     def generate_category_pie_chart(self):
         """生成分类饼图"""
+        # 确保使用中文字体
+        configure_matplotlib_chinese()
+        
         distribution = self.get_category_distribution()
+        
+        # 如果没有数据，确保至少显示"未分类"
+        if not distribution:
+            distribution = {"未分类": 0}
         
         # 创建饼图
         fig = Figure(figsize=(6, 6))
@@ -392,43 +464,83 @@ class EmailAnalytics:
             ax.text(0.5, 0.5, "暂无数据", horizontalalignment='center', verticalalignment='center')
             ax.axis('off')
         else:
-            ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
+            # 颜色映射
+            colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
+                     '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+                     
+            # 确保颜色足够
+            while len(colors) < len(labels):
+                colors.extend(colors)
+                
+            # 绘制饼图，添加颜色
+            patches, texts, autotexts = ax.pie(
+                sizes, 
+                labels=labels, 
+                autopct='%1.1f%%', 
+                startangle=90,
+                colors=colors[:len(labels)]
+            )
+            
+            # 设置字体大小和颜色
+            for text in texts:
+                text.set_fontsize(10)
+            for autotext in autotexts:
+                autotext.set_fontsize(9)
+                autotext.set_color('white')
+                
             ax.axis('equal')  # 使饼图为正圆形
             ax.set_title("邮件分类分布")
+            
+            # 如果类别太多，添加图例
+            if len(labels) > 5:
+                ax.legend(patches, labels, loc="best", fontsize=8)
         
         return fig
     
     def generate_daily_trend_chart(self, days=30):
         """生成每日趋势图"""
+        # 确保使用中文字体
+        configure_matplotlib_chinese()
+        
         daily_counts = self.get_daily_email_count(days)
         
         # 创建折线图
         fig = Figure(figsize=(8, 4))
         ax = fig.add_subplot(111)
         
-        dates = list(daily_counts.keys())
-        counts = list(daily_counts.values())
+        # 对日期进行排序
+        sorted_items = sorted(daily_counts.items(), key=lambda x: x[0])
+        dates = [item[0] for item in sorted_items]
+        counts = [item[1] for item in sorted_items]
         
         if sum(counts) == 0:  # 没有数据
-            ax.text(0.5, 0.5, "暂无数据", horizontalalignment='center', verticalalignment='center')
+            ax.text(0.5, 0.5, "暂无数据", horizontalalignment='center', verticalalignment='center', fontsize=14)
             ax.axis('off')
         else:
             # 绘制折线图
-            ax.plot(dates, counts, marker='o')
+            ax.plot(range(len(dates)), counts, marker='o', linestyle='-', color='#1f77b4', linewidth=2)
             
             # 设置x轴标签
             if len(dates) > 10:
                 # 如果日期太多，只显示部分
-                step = len(dates) // 10
-                ax.set_xticks(dates[::step])
-                ax.set_xticklabels(dates[::step], rotation=45)
+                step = max(1, len(dates) // 10)
+                indices = range(0, len(dates), step)
+                ax.set_xticks(indices)
+                ax.set_xticklabels([dates[i] for i in indices], rotation=45)
             else:
-                ax.set_xticks(dates)
+                ax.set_xticks(range(len(dates)))
                 ax.set_xticklabels(dates, rotation=45)
             
             ax.set_title("每日邮件数量趋势")
             ax.set_xlabel("日期")
             ax.set_ylabel("邮件数量")
+            
+            # 添加网格线
+            ax.grid(True, linestyle='--', alpha=0.7)
+            
+            # 设置y轴最小值为0
+            ax.set_ylim(bottom=0)
+            
             fig.tight_layout()
         
         return fig
@@ -571,6 +683,9 @@ class StatisticsWidget(QWidget):
         
     def refresh(self):
         """刷新统计数据"""
+        # 确保使用中文字体
+        configure_matplotlib_chinese()
+        
         # 重新生成图表
         pie_chart = self.analytics.generate_category_pie_chart()
         trend_chart = self.analytics.generate_daily_trend_chart()
@@ -580,4 +695,20 @@ class StatisticsWidget(QWidget):
         self.pie_widget.canvas.draw()
         
         self.trend_widget.canvas.figure = trend_chart
-        self.trend_widget.canvas.draw() 
+        self.trend_widget.canvas.draw()
+        
+        # 更新统计数据
+        total_emails = self.analytics.count_emails_by_period(None)
+        weekly_emails = self.analytics.count_emails_by_period('week')
+        response_stats = self.analytics.get_response_time_stats()
+        
+        # 更新标签（假设有相应的标签属性）
+        if hasattr(self, 'total_label'):
+            self.total_label.setText(f"总邮件数：{total_emails}")
+        
+        if hasattr(self, 'weekly_label'):
+            self.weekly_label.setText(f"本周邮件数：{weekly_emails}")
+        
+        if hasattr(self, 'avg_label'):
+            avg_time = response_stats['avg_response_time']
+            self.avg_label.setText(f"平均回复时间：{avg_time:.2f}分钟") 
