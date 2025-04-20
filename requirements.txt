@@ -4,4 +4,4 @@ smtplib
 nltk
 pandas
 matplotlib
-tkinter
+PyQt6

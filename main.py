@@ -1,10 +1,11 @@
-import tkinter as tk  # 确保导入 tkinter
+import sys
 from email_connector import EmailConnector
 from email_classifier import EmailClassifier
 from auto_reply import AutoReplyGenerator
 from email_sender import EmailSender
 import config
-from gui import EmailAssistantGUI  # 导入GUI模块
+from PyQt6.QtWidgets import QApplication
+from gui_pyqt6 import EmailAssistantGUI, ThemeManager, ShortcutManager  # 导入PyQt6界面模块
 
 class EmailAssistant:
     def __init__(self):
@@ -73,11 +74,30 @@ if __name__ == "__main__":
     print("创建邮件助手实例")
     assistant = EmailAssistant()
 
-    # 运行图形界面
+    # 运行图形界面 - 使用PyQt6替代tkinter
     print("启动图形界面")
-    root = tk.Tk()  # 确保使用导入的 tkinter
-    app = EmailAssistantGUI(root)
-    root.mainloop()
-
+    app = QApplication(sys.argv)
+    
+    # 创建主窗口
+    window = EmailAssistantGUI()
+    
+    # 初始化主题管理器
+    theme_manager = ThemeManager(app)
+    theme_manager.apply_theme("light")
+    
+    # 关联主题管理器到窗口
+    window.theme_manager = theme_manager
+    
+    window.show()
+    
+    # 初始化快捷键管理器
+    shortcut_manager = ShortcutManager(window)
+    
+    # 启动应用
+    exit_code = app.exec()
+    
     # 关闭邮箱连接
     assistant.close()
+    
+    # 退出应用
+    sys.exit(exit_code)
