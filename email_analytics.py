@@ -6,7 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTabWidget, QComboBox, QFrame
 from PyQt6.QtCore import Qt
 import matplotlib
 
@@ -22,28 +22,29 @@ def configure_matplotlib_chinese():
     ]
     
     # 检查可用的字体
-    from matplotlib.font_manager import FontProperties, findSystemFonts, FontManager
-    font_manager = FontManager()
-    available_fonts = [f.name for f in font_manager.ttflist]
+    available_fonts = matplotlib.font_manager.findSystemFonts(fontpaths=None)
+    chinese_font_found = False
     
-    found_font = None
-    for font in chinese_fonts:
-        if font in available_fonts:
-            found_font = font
-            break
+    for font_path in available_fonts:
+        try:
+            font = matplotlib.font_manager.FontProperties(fname=font_path)
+            if font.get_name() in chinese_fonts:
+                matplotlib.rcParams['font.family'] = font.get_name()
+                chinese_font_found = True
+                break
+        except:
+            continue
     
-    if found_font:
-        print(f"使用中文字体: {found_font}")
-        # 设置matplotlib的字体
-        plt.rcParams['font.sans-serif'] = [found_font, 'DejaVu Sans']
-        plt.rcParams['axes.unicode_minus'] = False  # 正确显示负号
-    else:
-        print("警告: 未找到可用的中文字体，图表中的中文可能无法正确显示")
+    # 设置matplotlib字体
+    if not chinese_font_found:
+        plt.rcParams['font.sans-serif'] = chinese_fonts
+    plt.rcParams['axes.unicode_minus'] = False  # 正确显示负号
         
-    # 为不支持中文的环境提供备用方案
-    matplotlib.rcParams['axes.formatter.use_locale'] = True
-    import locale
-    locale.setlocale(locale.LC_ALL, '')
+    return chinese_font_found
+
+# 为不支持中文的环境提供备用方案
+def safe_decode(text):
+    return text.encode('utf-8').decode('utf-8', 'ignore')
 
 # 初始化时配置字体
 configure_matplotlib_chinese()
@@ -70,23 +71,26 @@ class EmailAnalytics:
         CREATE TABLE IF NOT EXISTS emails (
             id TEXT PRIMARY KEY,
             sender TEXT,
-            receiver TEXT,
             subject TEXT,
             body TEXT,
             date TEXT,
             category TEXT,
-            processed INTEGER DEFAULT 0,
-            replied INTEGER DEFAULT 0,
-            replied_at TEXT
+            is_replied INTEGER DEFAULT 0,
+            reply_content TEXT,
+            reply_date TEXT,
+            response_time REAL,
+            created_at TEXT
         )
         ''')
         
         # 创建统计表
         cursor.execute('''
-        CREATE TABLE IF NOT EXISTS stats (
+        CREATE TABLE IF NOT EXISTS statistics (
             date TEXT,
             category TEXT,
             count INTEGER,
+            reply_count INTEGER,
+            avg_response_time REAL,
             PRIMARY KEY (date, category)
         )
         ''')
@@ -107,48 +111,57 @@ class EmailAnalytics:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
+            # 提取必要字段
+            email_id = email_data.get('id', '')
+            sender = email_data.get('from', '')
+            subject = email_data.get('subject', '')
+            body = email_data.get('body', '')
+            date = email_data.get('date', '')
+            category = email_data.get('category', '未分类')
+            
             # 检查是否已存在
-            cursor.execute("SELECT id FROM emails WHERE id = ?", (email_data.get('id', ''),))
+            cursor.execute("SELECT id FROM emails WHERE id = ?", (email_id,))
             if cursor.fetchone():
                 # 更新现有记录
                 cursor.execute('''
-                UPDATE emails SET
-                    sender = ?,
-                    receiver = ?,
-                    subject = ?,
-                    body = ?,
-                    date = ?,
-                    category = ?
+                UPDATE emails SET 
+                sender = ?,
+                subject = ?,
+                body = ?,
+                date = ?,
+                category = ?,
+                is_replied = ?,
+                reply_content = ?,
+                reply_date = ?,
+                response_time = ?
                 WHERE id = ?
                 ''', (
-                    email_data.get('from', ''),
-                    email_data.get('to', ''),
-                    email_data.get('subject', ''),
-                    email_data.get('body', ''),
-                    email_data.get('date', ''),
-                    email_data.get('category', '未分类'),
-                    email_data.get('id', '')
+                    sender, subject, body, date, category, 
+                    email_data.get('is_replied', 0),
+                    email_data.get('reply_content', ''),
+                    email_data.get('reply_date', ''),
+                    email_data.get('response_time', 0),
+                    email_id
                 ))
             else:
                 # 插入新记录
                 cursor.execute('''
-                INSERT INTO emails (
-                    id, sender, receiver, subject, body, date, category
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO emails (id, sender, subject, body, date, category, is_replied, 
+                                  reply_content, reply_date, response_time, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    email_data.get('id', ''),
-                    email_data.get('from', ''),
-                    email_data.get('to', ''),
-                    email_data.get('subject', ''),
-                    email_data.get('body', ''),
-                    email_data.get('date', ''),
-                    email_data.get('category', '未分类')
+                    email_id, sender, subject, body, date, category,
+                    email_data.get('is_replied', 0),
+                    email_data.get('reply_content', ''),
+                    email_data.get('reply_date', ''),
+                    email_data.get('response_time', 0),
+                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 ))
             
             conn.commit()
             
             # 更新统计数据
-            self.update_stats(email_data.get('category', '未分类'))
+            self.update_statistics()
             
             return True
         except Exception as e:
@@ -157,558 +170,537 @@ class EmailAnalytics:
         finally:
             conn.close()
     
-    def update_stats(self, category):
-        """更新统计数据
+    def update_statistics(self):
+        """更新统计数据表"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         
-        Args:
-            category: 邮件分类
-        """
+        # 获取今天的日期
         today = datetime.datetime.now().strftime("%Y-%m-%d")
         
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+        # 获取所有分类
+        cursor.execute("SELECT DISTINCT category FROM emails")
+        categories = [row[0] for row in cursor.fetchall()]
+        
+        # 对每个分类更新今天的统计
+        for category in categories:
+            if not category:
+                category = "未分类"
+                
+            # 查询今天的该分类的邮件数
+            cursor.execute('''
+            SELECT COUNT(*), SUM(is_replied), AVG(response_time)
+            FROM emails 
+            WHERE category = ? AND date(created_at) = date(?)
+            ''', (category, today))
+            
+            row = cursor.fetchone()
+            count = row[0] or 0
+            reply_count = row[1] or 0
+            avg_response_time = row[2] or 0
             
             # 检查今天的该分类的记录是否存在
-            cursor.execute("SELECT count FROM stats WHERE date = ? AND category = ?", (today, category))
-            result = cursor.fetchone()
+            cursor.execute('''
+            SELECT count, reply_count, avg_response_time
+            FROM statistics
+            WHERE date = ? AND category = ?
+            ''', (today, category))
             
-            if result:
+            if cursor.fetchone():
                 # 更新现有记录
                 cursor.execute('''
-                UPDATE stats SET count = count + 1
+                UPDATE statistics SET
+                count = ?, reply_count = ?, avg_response_time = ?
                 WHERE date = ? AND category = ?
-                ''', (today, category))
+                ''', (count, reply_count, avg_response_time, today, category))
             else:
                 # 插入新记录
                 cursor.execute('''
-                INSERT INTO stats (date, category, count)
-                VALUES (?, ?, 1)
-                ''', (today, category))
-            
-            conn.commit()
-        except Exception as e:
-            print(f"更新统计数据失败: {e}")
-        finally:
-            conn.close()
-    
-    def mark_email_replied(self, email_id):
-        """标记邮件为已回复
+                INSERT INTO statistics (date, category, count, reply_count, avg_response_time)
+                VALUES (?, ?, ?, ?, ?)
+                ''', (today, category, count, reply_count, avg_response_time))
         
-        Args:
-            email_id: 邮件ID
-            
-        Returns:
-            bool: 是否成功
-        """
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            replied_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
+        conn.commit()
+        conn.close()
+    
+    def get_email_categories(self, date_range=None):
+        """获取邮件类别分布数据"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        if date_range:
+            # 根据日期范围生成查询条件
+            if date_range == 'today':
+                date_limit = datetime.datetime.now().strftime("%Y-%m-%d")
+                cursor.execute('''
+                SELECT category, COUNT(*) as count
+                FROM emails
+                WHERE DATE(created_at) = ?
+                GROUP BY category
+                ''', (date_limit,))
+            elif date_range == 'week':
+                week_ago = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+                cursor.execute('''
+                SELECT category, COUNT(*) as count
+                FROM emails
+                WHERE DATE(created_at) >= ?
+                GROUP BY category
+                ''', (week_ago,))
+            elif date_range == 'month':
+                month_ago = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+                cursor.execute('''
+                SELECT category, COUNT(*) as count
+                FROM emails
+                WHERE DATE(created_at) >= ?
+                GROUP BY category
+                ''', (month_ago,))
+            elif date_range == 'year':
+                year_ago = (datetime.datetime.now() - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
+                cursor.execute('''
+                SELECT category, COUNT(*) as count
+                FROM emails
+                WHERE DATE(created_at) >= ?
+                GROUP BY category
+                ''', (year_ago,))
+        else:
+            # 不限日期
             cursor.execute('''
-            UPDATE emails SET
-                replied = 1,
-                replied_at = ?
-            WHERE id = ?
-            ''', (replied_at, email_id))
-            
-            conn.commit()
-            return True
-        except Exception as e:
-            print(f"标记邮件已回复失败: {e}")
-            return False
-        finally:
-            conn.close()
-    
-    def get_category_distribution(self, time_range=None):
-        """获取分类分布数据
-        
-        Args:
-            time_range: 时间范围，如'week', 'month', 'year'，None表示所有
-            
-        Returns:
-            dict: 分类分布数据
-        """
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            query = "SELECT category, COUNT(*) as count FROM emails"
-            params = []
-            
-            if time_range:
-                today = datetime.datetime.now()
-                if time_range == 'week':
-                    # 一周前
-                    start_date = (today - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-                elif time_range == 'month':
-                    # 一个月前（近似30天）
-                    start_date = (today - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
-                elif time_range == 'year':
-                    # 一年前
-                    start_date = (today - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
-                else:
-                    start_date = None
-                
-                if start_date:
-                    query += " WHERE date >= ?"
-                    params.append(start_date)
-            
-            query += " GROUP BY category"
-            
-            cursor.execute(query, params)
-            results = cursor.fetchall()
-            
-            # 确保有默认分类
-            distribution = {}
-            for category, count in results:
-                # 处理空类别或None类别
-                if not category or category.strip() == '':
-                    category = '未分类'
-                
-                # 合并相同类别
-                if category in distribution:
-                    distribution[category] += count
-                else:
-                    distribution[category] = count
-            
-            # 确保至少有一个类别
-            if not distribution:
-                # 查询总邮件数
-                cursor.execute("SELECT COUNT(*) FROM emails")
-                total_count = cursor.fetchone()[0]
-                
-                if total_count > 0:
-                    distribution['其他'] = total_count
-            
-            return distribution
-        except Exception as e:
-            print(f"获取分类分布数据失败: {e}")
-            return {}
-        finally:
-            conn.close()
-    
-    def get_daily_email_count(self, days=30):
-        """获取每日邮件数量
-        
-        Args:
-            days: 天数
-            
-        Returns:
-            dict: 日期到数量的映射
-        """
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            # 获取日期范围
-            end_date = datetime.datetime.now()
-            start_date = end_date - datetime.timedelta(days=days)
-            
-            # 生成日期列表
-            date_list = []
-            current_date = start_date
-            while current_date <= end_date:
-                date_list.append(current_date.strftime("%Y-%m-%d"))
-                current_date += datetime.timedelta(days=1)
-            
-            # 使用 strftime 函数处理日期 - 更可靠的 SQL 方法
-            cursor.execute('''
-            SELECT strftime('%Y-%m-%d', date) as day, COUNT(*) as count
+            SELECT category, COUNT(*) as count
             FROM emails
-            WHERE date >= ?
-            GROUP BY day
-            ''', (start_date.strftime("%Y-%m-%d"),))
-            
-            results = cursor.fetchall()
-            
-            # 处理结果填充到日期列表
-            daily_counts = {date: 0 for date in date_list}
-            
-            for day, count in results:
-                if day in daily_counts:
-                    daily_counts[day] = count
-                else:
-                    # 日期格式可能不同，打印日志
-                    print(f"警告: 日期格式不匹配: {day}")
-            
-            return daily_counts
-        except Exception as e:
-            print(f"获取每日邮件数量失败: {e}")
-            return {date: 0 for date in date_list} if 'date_list' in locals() else {}
-        finally:
-            if 'conn' in locals() and conn:
-                conn.close()
-    
-    def get_response_time_stats(self):
-        """获取回复时间统计
-        
-        Returns:
-            dict: 回复时间统计
-        """
-        try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row  # 使用字典游标
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-            SELECT 
-                id, 
-                date, 
-                replied_at,
-                JULIANDAY(replied_at) - JULIANDAY(date) as response_time
-            FROM emails
-            WHERE replied = 1
+            GROUP BY category
             ''')
             
-            results = cursor.fetchall()
-            
-            if not results:
-                return {
-                    "avg_response_time": 0,
-                    "min_response_time": 0,
-                    "max_response_time": 0,
-                    "total_replies": 0
-                }
-            
-            response_times = [row['response_time'] * 24 * 60 for row in results]  # 转换为分钟
-            
-            stats = {
-                "avg_response_time": sum(response_times) / len(response_times),
-                "min_response_time": min(response_times),
-                "max_response_time": max(response_times),
-                "total_replies": len(response_times)
-            }
-            
-            return stats
-        except Exception as e:
-            print(f"获取回复时间统计失败: {e}")
-            return {
-                "avg_response_time": 0,
-                "min_response_time": 0,
-                "max_response_time": 0,
-                "total_replies": 0
-            }
-        finally:
-            conn.close()
-    
-    def get_top_senders(self, time_range=None, limit=5):
-        """获取发件人排行
+        results = cursor.fetchall()
         
-        Args:
-            time_range: 时间范围，如'week', 'month', 'year'，None表示所有
-            limit: 限制数量
+        # 处理结果
+        categories = []
+        counts = []
+        
+        # 确保有默认分类
+        has_default = False
+        
+        # 处理空类别或None类别
+        for cat, count in results:
+            cat_name = cat if cat and cat.strip() else "未分类"
             
-        Returns:
-            list: 发件人列表
-        """
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            query = "SELECT sender, COUNT(*) as count FROM emails"
-            params = []
-            
-            if time_range:
-                today = datetime.datetime.now()
-                if time_range == 'week':
-                    # 一周前
-                    start_date = (today - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-                elif time_range == 'month':
-                    # 一个月前（近似30天）
-                    start_date = (today - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
-                elif time_range == 'year':
-                    # 一年前
-                    start_date = (today - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
-                else:
-                    start_date = None
+            # 合并相同类别
+            existing_idx = next((i for i, c in enumerate(categories) if c == cat_name), None)
+            if existing_idx is not None:
+                counts[existing_idx] += count
+            else:
+                categories.append(cat_name)
+                counts.append(count)
                 
-                if start_date:
-                    query += " WHERE date >= ?"
-                    params.append(start_date)
+        # 确保至少有一个类别
+        if not categories:
+            # 查询总邮件数
+            cursor.execute('SELECT COUNT(*) FROM emails')
+            total_count = cursor.fetchone()[0] or 0
             
-            query += " GROUP BY sender ORDER BY count DESC LIMIT ?"
-            params.append(limit)
-            
-            cursor.execute(query, params)
-            results = cursor.fetchall()
-            
-            return [{"sender": sender, "count": count} for sender, count in results]
-        except Exception as e:
-            print(f"获取发件人排行失败: {e}")
-            return []
-        finally:
-            conn.close()
+            categories = ["未分类"]
+            counts = [total_count]
+        
+        conn.close()
+        return categories, counts
     
-    def generate_category_pie_chart(self):
+    def get_email_trend(self, days=30, category=None):
+        """获取邮件趋势数据"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # 获取日期范围
+        today = datetime.datetime.now()
+        start_date = (today - datetime.timedelta(days=days-1)).strftime("%Y-%m-%d")
+        
+        # 生成日期列表
+        date_list = []
+        for i in range(days):
+            date = (today - datetime.timedelta(days=days-1-i)).strftime("%Y-%m-%d")
+            date_list.append(date)
+        
+        # 构建查询条件
+        if category and category != "全部":
+            # 使用 strftime 函数处理日期 - 更可靠的 SQL 方法
+            cursor.execute('''
+            SELECT date(created_at) as date, COUNT(*) as count
+            FROM emails
+            WHERE date(created_at) >= ? AND category = ?
+            GROUP BY date(created_at)
+            ORDER BY date(created_at)
+            ''', (start_date, category))
+        else:
+            cursor.execute('''
+            SELECT date(created_at) as date, COUNT(*) as count
+            FROM emails
+            WHERE date(created_at) >= ?
+            GROUP BY date(created_at)
+            ORDER BY date(created_at)
+            ''', (start_date,))
+        
+        # 处理结果填充到日期列表
+        results = cursor.fetchall()
+        date_counts = {}
+        
+        for date_str, count in results:
+            try:
+                # 日期格式可能不同，打印日志
+                date_counts[date_str] = count
+            except Exception as e:
+                print(f"日期处理出错: {date_str}, {e}")
+        
+        # 创建最终的数据集
+        counts = []
+        for date in date_list:
+            counts.append(date_counts.get(date, 0))
+        
+        conn.close()
+        return date_list, counts
+    
+    def get_response_data(self, days=30):
+        """获取回复统计数据"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row  # 使用字典游标
+        cursor = conn.cursor()
+        
+        # 今天的日期
+        today = datetime.datetime.now()
+        start_date = (today - datetime.timedelta(days=days-1)).strftime("%Y-%m-%d")
+        
+        # 查询回复数据
+        cursor.execute('''
+        SELECT 
+            is_replied, 
+            response_time
+        FROM emails
+        WHERE date(created_at) >= ?
+        ''', (start_date,))
+        
+        results = cursor.fetchall()
+        
+        # 统计数据
+        total_emails = len(results)
+        replied_emails = sum(1 for row in results if row['is_replied'] == 1)
+        reply_rate = replied_emails / total_emails if total_emails > 0 else 0
+        
+        # 计算平均响应时间（小时转分钟）
+        response_times = [row['response_time'] * 24 * 60 for row in results if row['is_replied'] == 1 and row['response_time'] is not None]
+        avg_response_time = sum(response_times) / len(response_times) if response_times else 0
+        
+        conn.close()
+        
+        return {
+            'total_emails': total_emails,
+            'replied_emails': replied_emails,
+            'reply_rate': reply_rate,
+            'avg_response_time': avg_response_time  # 分钟
+        }
+    
+    def get_email_stats(self, date_range=None):
+        """获取邮件统计数据"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        if date_range:
+            # 根据日期范围生成查询条件
+            if date_range == 'today':
+                date_limit = datetime.datetime.now().strftime("%Y-%m-%d")
+                cursor.execute('''
+                SELECT COUNT(*) as count, SUM(is_replied) as replied
+                FROM emails
+                WHERE DATE(created_at) = ?
+                ''', (date_limit,))
+            elif date_range == 'week':
+                week_ago = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+                cursor.execute('''
+                SELECT COUNT(*) as count, SUM(is_replied) as replied
+                FROM emails
+                WHERE DATE(created_at) >= ?
+                ''', (week_ago,))
+            elif date_range == 'month':
+                month_ago = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+                cursor.execute('''
+                SELECT COUNT(*) as count, SUM(is_replied) as replied
+                FROM emails
+                WHERE DATE(created_at) >= ?
+                ''', (month_ago,))
+            elif date_range == 'year':
+                year_ago = (datetime.datetime.now() - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
+                cursor.execute('''
+                SELECT COUNT(*) as count, SUM(is_replied) as replied
+                FROM emails
+                WHERE DATE(created_at) >= ?
+                ''', (year_ago,))
+        else:
+            # 不限日期
+            cursor.execute('''
+            SELECT COUNT(*) as count, SUM(is_replied) as replied
+            FROM emails
+            ''')
+            
+        row = cursor.fetchone()
+        count = row[0] or 0
+        replied = row[1] or 0
+        
+        conn.close()
+        
+        return {
+            'count': count,
+            'replied': replied,
+            'reply_rate': replied / count if count > 0 else 0
+        }
+    
+    def generate_category_pie(self, figure, date_range=None):
         """生成分类饼图"""
         # 确保使用中文字体
         configure_matplotlib_chinese()
         
-        distribution = self.get_category_distribution()
+        # 获取数据
+        categories, sizes = self.get_email_categories(date_range)
         
         # 如果没有数据，确保至少显示"未分类"
-        if not distribution:
-            distribution = {"未分类": 0}
+        if not categories or sum(sizes) == 0:
+            categories = ["无数据"]
+            sizes = [1]
         
         # 创建饼图
-        fig = Figure(figsize=(6, 6))
-        ax = fig.add_subplot(111)
+        figure.clear()
+        ax = figure.add_subplot(111)
         
-        labels = list(distribution.keys())
-        sizes = list(distribution.values())
-        
+        # 数据为0时显示一个空白的饼图
         if sum(sizes) == 0:  # 没有数据
-            ax.text(0.5, 0.5, "暂无数据", horizontalalignment='center', verticalalignment='center')
-            ax.axis('off')
-        else:
-            # 颜色映射
-            colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
-                     '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
-                     
-            # 确保颜色足够
-            while len(colors) < len(labels):
-                colors.extend(colors)
-                
-            # 绘制饼图，添加颜色
-            patches, texts, autotexts = ax.pie(
-                sizes, 
-                labels=labels, 
-                autopct='%1.1f%%', 
-                startangle=90,
-                colors=colors[:len(labels)]
-            )
-            
-            # 设置字体大小和颜色
-            for text in texts:
-                text.set_fontsize(10)
-            for autotext in autotexts:
-                autotext.set_fontsize(9)
-                autotext.set_color('white')
-                
-            ax.axis('equal')  # 使饼图为正圆形
-            ax.set_title("邮件分类分布")
-            
-            # 如果类别太多，添加图例
-            if len(labels) > 5:
-                ax.legend(patches, labels, loc="best", fontsize=8)
+            ax.text(0.5, 0.5, '无数据', horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
+            return
         
-        return fig
-    
-    def generate_daily_trend_chart(self, days=30):
+        # 颜色映射
+        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+          '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+        
+        # 确保颜色足够
+        while len(colors) < len(categories):
+            colors.extend(colors)
+        
+        # 绘制饼图，添加颜色
+        wedges, texts, autotexts = ax.pie(
+            sizes, 
+            labels=None, 
+            autopct='%1.1f%%',
+            startangle=90,
+            colors=colors[:len(categories)]
+        )
+        
+        # 设置字体大小和颜色
+        for autotext in autotexts:
+            autotext.set_color('white')
+            autotext.set_fontsize(9)
+        
+        ax.axis('equal')  # 使饼图为正圆形
+        
+        # 如果类别太多，添加图例
+        if len(categories) > 0:
+            ax.legend(wedges, categories, title="分类", loc="center left", bbox_to_anchor=(1, 0, 0.5, 1))
+            
+        return figure
+        
+    def generate_trend_chart(self, figure, days=30, category=None):
         """生成每日趋势图"""
         # 确保使用中文字体
         configure_matplotlib_chinese()
         
-        daily_counts = self.get_daily_email_count(days)
+        # 获取数据
+        dates, counts = self.get_email_trend(days, category)
         
         # 创建折线图
-        fig = Figure(figsize=(8, 4))
-        ax = fig.add_subplot(111)
+        figure.clear()
+        ax = figure.add_subplot(111)
         
         # 对日期进行排序
-        sorted_items = sorted(daily_counts.items(), key=lambda x: x[0])
-        dates = [item[0] for item in sorted_items]
-        counts = [item[1] for item in sorted_items]
+        dates = dates
+        counts = counts
         
+        # 数据为0时显示一个空白的图表
         if sum(counts) == 0:  # 没有数据
-            ax.text(0.5, 0.5, "暂无数据", horizontalalignment='center', verticalalignment='center', fontsize=14)
-            ax.axis('off')
+            ax.text(0.5, 0.5, '无数据', horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
+            return
+        
+        # 绘制折线图
+        ax.plot(range(len(dates)), counts, marker='o', linestyle='-', color='#1f77b4', linewidth=2)
+        
+        # 设置x轴标签
+        if days <= 31:
+            # 如果日期太多，只显示部分
+            step = max(1, len(dates) // 10)  # 最多显示10个标签
+            ax.set_xticks(range(0, len(dates), step))
+            ax.set_xticklabels([dates[i].split('-')[2] for i in range(0, len(dates), step)], rotation=45)
         else:
-            # 绘制折线图
-            ax.plot(range(len(dates)), counts, marker='o', linestyle='-', color='#1f77b4', linewidth=2)
+            # 月份显示
+            month_starts = []
+            for i, date in enumerate(dates):
+                if i == 0 or date.split('-')[1] != dates[i-1].split('-')[1]:
+                    month_starts.append((i, date.split('-')[1]))
             
-            # 设置x轴标签
-            if len(dates) > 10:
-                # 如果日期太多，只显示部分
-                step = max(1, len(dates) // 10)
-                indices = range(0, len(dates), step)
-                ax.set_xticks(indices)
-                ax.set_xticklabels([dates[i] for i in indices], rotation=45)
-            else:
-                ax.set_xticks(range(len(dates)))
-                ax.set_xticklabels(dates, rotation=45)
+            ax.set_xticks([i for i, _ in month_starts])
+            ax.set_xticklabels([f"{m}月" for _, m in month_starts], rotation=45)
             
-            ax.set_title("每日邮件数量趋势")
-            ax.set_xlabel("日期")
-            ax.set_ylabel("邮件数量")
-            
-            # 添加网格线
-            ax.grid(True, linestyle='--', alpha=0.7)
-            
-            # 设置y轴最小值为0
-            ax.set_ylim(bottom=0)
-            
-            fig.tight_layout()
+        # 添加网格线
+        ax.grid(True, linestyle='--', alpha=0.7)
         
-        return fig
-    
-    def generate_weekly_report(self):
-        """生成每周报告
+        # 设置y轴最小值为0
+        ax.set_ylim(bottom=0)
         
-        Returns:
-            dict: 报告数据
-        """
-        # 获取统计数据
-        stats = {
-            'total_emails': self.count_emails_by_period('week'),
-            'category_dist': self.get_category_distribution('week'),
-            'avg_response_time': self.get_response_time_stats()['avg_response_time'],
-            'top_senders': self.get_top_senders('week', limit=5)
-        }
+        ax.set_title(f"{'全部分类' if not category or category == '全部' else category}邮件趋势")
+        ax.set_ylabel("邮件数量")
         
-        return stats
-    
-    def count_emails_by_period(self, period):
-        """统计特定时间段内的邮件数量
-        
-        Args:
-            period: 时间段，'day', 'week', 'month', 'year'
-            
-        Returns:
-            int: 邮件数量
-        """
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            today = datetime.datetime.now()
-            
-            if period == 'day':
-                # 今天
-                start_date = today.strftime("%Y-%m-%d")
-            elif period == 'week':
-                # 一周前
-                start_date = (today - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-            elif period == 'month':
-                # 一个月前（近似30天）
-                start_date = (today - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
-            elif period == 'year':
-                # 一年前
-                start_date = (today - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
-            else:
-                # 默认所有
-                cursor.execute("SELECT COUNT(*) FROM emails")
-                return cursor.fetchone()[0]
-            
-            cursor.execute("SELECT COUNT(*) FROM emails WHERE date >= ?", (start_date,))
-            return cursor.fetchone()[0]
-        except Exception as e:
-            print(f"统计邮件数量失败: {e}")
-            return 0
-        finally:
-            conn.close()
+        return figure
 
-
-class ChartWidget(QWidget):
-    """图表小部件"""
-    
-    def __init__(self, figure, parent=None):
-        """初始化图表部件
-        
-        Args:
-            figure: matplotlib图表
-            parent: 父部件
-        """
-        super().__init__(parent)
-        
-        # 布局
-        layout = QVBoxLayout(self)
-        
-        # 创建画布
-        self.canvas = FigureCanvas(figure)
-        layout.addWidget(self.canvas)
-
-        
-class StatisticsWidget(QWidget):
-    """统计数据小部件"""
+class EmailStatsWidget(QWidget):
+    """统计分析组件"""
     
     def __init__(self, analytics, parent=None):
-        """初始化统计部件
-        
-        Args:
-            analytics: 分析器实例
-            parent: 父部件
-        """
         super().__init__(parent)
-        
         self.analytics = analytics
+        self.setup_ui()
+        
+    def setup_ui(self):
+        """设置UI界面"""
+        # 获取统计数据
+        total_stats = self.analytics.get_email_stats()
+        week_stats = self.analytics.get_email_stats('week')
+        month_stats = self.analytics.get_email_stats('month')
+        year_stats = self.analytics.get_email_stats('year')
+        today_stats = self.analytics.get_email_stats('today')
+        response_data = self.analytics.get_response_data()
         
         # 创建布局
+        layout = QVBoxLayout(self)
+        
+        # 今天
+        today_label = QLabel(f"今日邮件: {today_stats['count']} 封")
+        layout.addWidget(today_label)
+        
+        # 一周前
+        week_label = QLabel(f"本周邮件: {week_stats['count']} 封")
+        layout.addWidget(week_label)
+        
+        # 一个月前（近似30天）
+        month_label = QLabel(f"本月邮件: {month_stats['count']} 封")
+        layout.addWidget(month_label)
+        
+        # 一年前
+        year_label = QLabel(f"今年邮件: {year_stats['count']} 封")
+        layout.addWidget(year_label)
+        
+        # 默认所有
+        total_label = QLabel(f"累计邮件: {total_stats['count']} 封")
+        layout.addWidget(total_label)
+        
+        # 回复率
+        reply_rate = response_data['reply_rate'] * 100
+        reply_label = QLabel(f"回复率: {reply_rate:.1f}%")
+        layout.addWidget(reply_label)
+        
+        # 平均响应时间
+        avg_time = response_data['avg_response_time']
+        response_label = QLabel(f"平均响应时间: {avg_time:.1f} 分钟")
+        layout.addWidget(response_label)
+
+class AnalyticsWidget(QWidget):
+    """图表小部件"""
+    
+    def __init__(self, analytics, parent=None):
+        super().__init__(parent)
+        self.analytics = analytics
+        self.figure1 = plt.figure(figsize=(4, 3), dpi=100)
+        self.figure2 = plt.figure(figsize=(5, 3), dpi=100)
+        self.setup_ui()
+        
+    def setup_ui(self):
+        # 布局
         main_layout = QVBoxLayout(self)
         
+        # 创建画布
+        self.canvas1 = FigureCanvas(self.figure1)
+        self.canvas2 = FigureCanvas(self.figure2)
+        
+        tabs = QTabWidget()
+        stats_tab = QWidget()
+        self.statistics_widget = EmailStatsWidget(self.analytics)
+        
+        # 统计数据小部件
+        stat_layout = QVBoxLayout(stats_tab)
+        
+        # 创建布局
+        controls_layout = QHBoxLayout()
+        
         # 标题
-        title_label = QLabel("邮件统计数据")
-        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title_label.setStyleSheet("font-size: 18px; font-weight: bold;")
+        title_label = QLabel("邮件分类统计")
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
         main_layout.addWidget(title_label)
         
         # 图表区域
-        charts_layout = QHBoxLayout()
+        chart_layout = QHBoxLayout()
         
         # 分类饼图
-        pie_chart = self.analytics.generate_category_pie_chart()
-        self.pie_widget = ChartWidget(pie_chart)
-        charts_layout.addWidget(self.pie_widget)
+        pie_container = QWidget()
+        pie_layout = QVBoxLayout(pie_container)
+        pie_layout.addWidget(self.canvas1)
         
         # 趋势图
-        trend_chart = self.analytics.generate_daily_trend_chart()
-        self.trend_widget = ChartWidget(trend_chart)
-        charts_layout.addWidget(self.trend_widget)
+        trend_container = QWidget()
+        trend_layout = QVBoxLayout(trend_container)
         
-        main_layout.addLayout(charts_layout)
+        self.category_combo = QComboBox()
+        self.category_combo.addItem("全部")
+        categories = self.analytics.get_email_categories()[0]
+        for cat in categories:
+            self.category_combo.addItem(cat)
+        self.category_combo.currentIndexChanged.connect(self.refresh)
+        
+        trend_layout.addWidget(self.category_combo)
+        trend_layout.addWidget(self.canvas2)
+        
+        chart_layout.addWidget(pie_container)
+        chart_layout.addWidget(trend_container)
+        main_layout.addLayout(chart_layout)
         
         # 统计数据区域
         stats_layout = QHBoxLayout()
         
         # 邮件总数
-        total_emails = self.analytics.count_emails_by_period(None)
-        total_label = QLabel(f"总邮件数：{total_emails}")
-        stats_layout.addWidget(total_label)
+        total_frame = QFrame()
+        total_frame.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
+        total_layout = QVBoxLayout(total_frame)
         
         # 本周邮件数
-        weekly_emails = self.analytics.count_emails_by_period('week')
-        weekly_label = QLabel(f"本周邮件数：{weekly_emails}")
-        stats_layout.addWidget(weekly_label)
+        week_frame = QFrame()
+        week_frame.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
+        week_layout = QVBoxLayout(week_frame)
         
         # 回复统计
-        response_stats = self.analytics.get_response_time_stats()
-        avg_time = response_stats['avg_response_time']
-        avg_label = QLabel(f"平均回复时间：{avg_time:.2f}分钟")
-        stats_layout.addWidget(avg_label)
+        reply_frame = QFrame()
+        reply_frame.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
+        reply_layout = QVBoxLayout(reply_frame)
         
-        main_layout.addLayout(stats_layout)
+        stat_layout.addWidget(self.statistics_widget)
+        tabs.addTab(stats_tab, "统计数据")
+        main_layout.addWidget(tabs)
         
+        # 初始刷新
+        self.refresh()
+    
     def refresh(self):
         """刷新统计数据"""
         # 确保使用中文字体
         configure_matplotlib_chinese()
         
         # 重新生成图表
-        pie_chart = self.analytics.generate_category_pie_chart()
-        trend_chart = self.analytics.generate_daily_trend_chart()
+        category = self.category_combo.currentText() if self.category_combo.currentIndex() > 0 else None
+        self.analytics.generate_category_pie(self.figure1, 'month')
+        self.analytics.generate_trend_chart(self.figure2, 30, category)
         
         # 更新画布
-        self.pie_widget.canvas.figure = pie_chart
-        self.pie_widget.canvas.draw()
-        
-        self.trend_widget.canvas.figure = trend_chart
-        self.trend_widget.canvas.draw()
+        self.canvas1.draw()
+        self.canvas2.draw()
         
         # 更新统计数据
-        total_emails = self.analytics.count_emails_by_period(None)
-        weekly_emails = self.analytics.count_emails_by_period('week')
-        response_stats = self.analytics.get_response_time_stats()
-        
-        # 更新标签（假设有相应的标签属性）
-        if hasattr(self, 'total_label'):
-            self.total_label.setText(f"总邮件数：{total_emails}")
-        
-        if hasattr(self, 'weekly_label'):
-            self.weekly_label.setText(f"本周邮件数：{weekly_emails}")
-        
-        if hasattr(self, 'avg_label'):
-            avg_time = response_stats['avg_response_time']
-            self.avg_label.setText(f"平均回复时间：{avg_time:.2f}分钟") 
+        if hasattr(self, 'statistics_widget'):
+            self.statistics_widget = EmailStatsWidget(self.analytics) 

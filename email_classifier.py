@@ -8,7 +8,7 @@ nltk.download('stopwords')
 
 class EmailClassifier:
     def __init__(self, config=None):
-        # 如果没有提供config参数，则自动加载
+        # 自动加载配置
         if config is None:
             from config import load_config
             config = load_config()
@@ -19,13 +19,9 @@ class EmailClassifier:
 
     def preprocess_text(self, text):
         """文本预处理"""
-        # 转小写
         text = text.lower()
-        # 去除标点符号和特殊字符
         text = re.sub(r'[^\w\s]', '', text)
-        # 分词
         tokens = word_tokenize(text)
-        # 去除停用词
         filtered_tokens = [word for word in tokens if word not in self.stop_words]
         return ' '.join(filtered_tokens)
 
@@ -34,10 +30,10 @@ class EmailClassifier:
         processed_subject = self.preprocess_text(email_data['subject'])
         processed_body = self.preprocess_text(email_data['body'])
 
-        # 合并主题和正文进行分类
+        # 合并主题和正文
         combined_text = processed_subject + ' ' + processed_body
 
-        # 基于关键词的分类
+        # 基于关键词分类
         category = self._rule_based_classification(combined_text)
         return category
 
